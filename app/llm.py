@@ -86,7 +86,7 @@ def _interpret_gemini(system_prompt: str, user_message: str, num_notes: int) -> 
     }
 
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name="gemini-2.5-flash",
         generation_config=genai.GenerationConfig(
             temperature=0,
             response_mime_type="application/json",
@@ -114,7 +114,7 @@ def _interpret_groq(system_prompt: str, user_message: str, num_notes: int) -> Li
 
     client = Groq(api_key=api_key)
 
-    for model_id in ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"):
+    for model_id in ("openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"):
         try:
             chat = client.chat.completions.create(
                 model=model_id,
@@ -155,42 +155,43 @@ def _interpret_groq(system_prompt: str, user_message: str, num_notes: int) -> Li
 # ─── HuggingFace provider ─────────────────────────────────────────────────────
 
 def _interpret_hf(system_prompt: str, user_message: str, num_notes: int) -> List[dict]:
-    """Call HuggingFace Inference API for text generation."""
+    """
+    Call HuggingFace's current Inference Providers router (OpenAI-compatible
+    chat completions). The legacy api-inference.huggingface.co serverless API
+    was retired by HF in 2025 — router.huggingface.co is the replacement.
+
+    Note: the HF token needs "Inference Providers" permission enabled
+    (https://huggingface.co/settings/tokens) or every model call here returns
+    a 401 permission error, which is caught and treated as provider failure.
+    """
     import requests as req  # type: ignore
 
     token = os.environ.get("HF_API_TOKEN", "")
     if not token:
         raise ValueError("HF_API_TOKEN not set")
 
-    # Combine system + user into a single prompt
-    full_prompt = (
-        f"{system_prompt}\n\n"
-        f"User: {user_message}\n\n"
-        f"Assistant (return only the JSON array, no extra text):"
-    )
-
     hf_models = [
-        "mistralai/Mistral-7B-Instruct-v0.3",
-        "meta-llama/Meta-Llama-3-8B-Instruct",
         "Qwen/Qwen2.5-7B-Instruct",
+        "meta-llama/Meta-Llama-3-8B-Instruct",
+        "mistralai/Mistral-7B-Instruct-v0.3",
     ]
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     last_error: Optional[Exception] = None
 
     for model_id in hf_models:
         try:
             resp = req.post(
-                f"https://api-inference.huggingface.co/models/{model_id}",
+                "https://router.huggingface.co/v1/chat/completions",
                 headers=headers,
                 json={
-                    "inputs": full_prompt,
-                    "parameters": {
-                        "max_new_tokens": 1024,
-                        "temperature": 0.01,
-                        "return_full_text": False,
-                    },
-                    "options": {"wait_for_model": True},
+                    "model": model_id,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 1024,
                 },
                 timeout=60,
             )
@@ -198,16 +199,11 @@ def _interpret_hf(system_prompt: str, user_message: str, num_notes: int) -> List
                 logger.warning("HF rate limit for %s", model_id)
                 continue
             if resp.status_code != 200:
-                logger.warning("HF %s returned %s", model_id, resp.status_code)
+                logger.warning("HF %s returned %s: %s", model_id, resp.status_code, resp.text[:300])
                 continue
 
             data = resp.json()
-            if isinstance(data, list) and data:
-                text = data[0].get("generated_text", "")
-            elif isinstance(data, dict):
-                text = data.get("generated_text", "")
-            else:
-                continue
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
             parsed = _extract_json_array(text)
             if parsed is not None:
